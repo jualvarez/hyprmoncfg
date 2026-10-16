@@ -95,7 +95,13 @@ prove physical projector readiness.
 Resuming or opening the lid is a request for light. When displays still report
 DPMS off right afterwards, the daemon treats it as a wake that did not take and
 repeats it up to three times before treating the displays as asleep by choice.
-It stops early once any display is seen awake or the layout applies. If the
+It stops early once every connected, enabled output in the effective layout is
+awake. A lit laptop panel does not hide an external output still reporting DPMS
+off. Partial wakes use the same bounded retries without reloading an unchanged
+layout; after exhaustion, the awake desktop remains usable. Ordinary display
+sleep outside a resume or lid-open request does not initiate wake retries.
+An in-flight wake does not turn a successful profile-selection IPC operation into
+an error; background reconciliation retains its pending-wake retry state. If the
 built-in panel is off while the lid is open (it was switched off with the lid
 shut and the external stayed asleep), the daemon applies the profile anyway,
 so the panel comes back without waiting for the external. The wake command uses

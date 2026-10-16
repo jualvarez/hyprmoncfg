@@ -1,13 +1,19 @@
 package daemon
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/crmne/hyprmoncfg/internal/hypr"
+	"github.com/crmne/hyprmoncfg/internal/ipc"
 	"github.com/crmne/hyprmoncfg/internal/lid"
+	"github.com/crmne/hyprmoncfg/internal/profile"
 )
 
 func dpmsWakeCount(path string) int {
@@ -16,6 +22,98 @@ func dpmsWakeCount(path string) int {
 		return 0
 	}
 	return strings.Count(string(data), "dispatch dpms on")
+}
+
+func TestWakeIncompleteRespectsExplicitWakeAndDisabledOutputs(t *testing.T) {
+	monitors := []hypr.Monitor{
+		{Name: "eDP-1", Width: 1920, Height: 1080, Scale: 1, DPMSStatus: true},
+		{Name: "DP-1", Width: 1920, Height: 1080, Scale: 1, DPMSStatus: false},
+	}
+	svc := &Service{}
+	target := profile.FromMonitors("Desk", monitors)
+	if svc.wakeIncomplete(target, monitors) {
+		t.Fatal("ordinary display sleep requested a wake")
+	}
+	svc.wakeRequested.Store(true)
+	if !svc.wakeIncomplete(target, monitors) {
+		t.Fatal("partial wake counted as complete")
+	}
+	for i := range target.Outputs {
+		if target.Outputs[i].Name == "DP-1" {
+			target.Outputs[i].Enabled = false
+		}
+	}
+	if svc.wakeIncomplete(target, monitors) {
+		t.Fatal("deliberately disabled display requested a wake")
+	}
+}
+
+func TestRunStopsPartialWakeRetriesOnceExternalWakes(t *testing.T) {
+	monitors := []hypr.Monitor{
+		{Name: "eDP-1", Make: "Example", Model: "Laptop", Width: 1920, Height: 1080, RefreshRate: 60, Scale: 1, DPMSStatus: true},
+		{Name: "DP-1", Make: "Example", Model: "Desk", Width: 1920, Height: 1080, RefreshRate: 60, X: 1920, Scale: 1, DPMSStatus: true},
+	}
+	env := newRunTestEnvConfigured(t, monitors, func(cfg *Config) { cfg.PollInterval = 20 * time.Millisecond; cfg.WakeSettle = 200 * time.Millisecond })
+	defer env.stop()
+	waitFor(t, time.Second, func() bool { return env.logs.contains("applied profile: Home") }, "startup apply")
+	env.suspendEvents <- true
+	monitors[1].DPMSStatus = false
+	if err := writeMonitorState(env.monitorStatePath, monitors); err != nil {
+		t.Fatal(err)
+	}
+	env.suspendEvents <- false
+	waitFor(t, time.Second, func() bool { return dpmsWakeCount(env.logPath) == 2 }, "first partial wake retry")
+	monitors[1].DPMSStatus = true
+	if err := writeMonitorState(env.monitorStatePath, monitors); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * env.svc.cfg.WakeSettle)
+	if got := dpmsWakeCount(env.logPath); got != 2 {
+		t.Fatalf("wake continued after recovery: %d", got)
+	}
+	// A later, intentional external sleep must not revive the old request.
+	monitors[1].DPMSStatus = false
+	if err := writeMonitorState(env.monitorStatePath, monitors); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * env.svc.cfg.WakeSettle)
+	if got := dpmsWakeCount(env.logPath); got != 2 {
+		t.Fatalf("later sleep repeated an expired wake: %d", got)
+	}
+}
+
+func TestRunRetriesPartialWakeWithoutReloadingOrWakingForever(t *testing.T) {
+	monitors := []hypr.Monitor{
+		{Name: "eDP-1", Make: "Example", Model: "Laptop", Width: 1920, Height: 1080, RefreshRate: 60, Scale: 1, DPMSStatus: true},
+		{Name: "DP-1", Make: "Example", Model: "Desk", Width: 1920, Height: 1080, RefreshRate: 60, X: 1920, Scale: 1, DPMSStatus: true},
+	}
+	env := newRunTestEnvConfigured(t, monitors, func(cfg *Config) { cfg.PollInterval = 20 * time.Millisecond })
+	defer env.stop()
+	defer func() {
+		if t.Failed() {
+			t.Log(env.logs.all())
+		}
+	}()
+	waitFor(t, time.Second, func() bool { return env.logs.contains("applied profile: Home") }, "startup apply")
+	env.suspendEvents <- true
+	// The laptop wakes but the dock ignores the initial wake request. Neither
+	// a valid mode nor one awake panel proves the other output has woken.
+	monitors[1].DPMSStatus = false
+	if err := writeMonitorState(env.monitorStatePath, monitors); err != nil {
+		t.Fatal(err)
+	}
+	env.suspendEvents <- false
+	waitFor(t, 2*time.Second, func() bool { return dpmsWakeCount(env.logPath) == 1+wakeRetryLimit }, "partial wake retries")
+	time.Sleep(4 * env.svc.cfg.WakeSettle)
+	if got := dpmsWakeCount(env.logPath); got != 1+wakeRetryLimit {
+		t.Fatalf("unbounded wake requests: %d", got)
+	}
+	if got := reloadCount(env.logPath); got != 1 {
+		t.Fatalf("partial wake caused %d reloads, want startup only", got)
+	}
+	if env.logs.contains("display sleep detected; pausing automatic switching") {
+		t.Fatal("one sleeping output put the awake desktop to sleep")
+	}
 }
 
 // Right after resume, displays still reporting DPMS off are a wake that did
@@ -104,5 +202,37 @@ func TestRunRestoresTheLaptopPanelWhenTheExternalStaysAsleepAfterLidOpen(t *test
 	waitFor(t, 2*time.Second, func() bool { return reloadCount(env.logPath) == 3 }, "panel restored despite the sleeping external")
 	if env.logs.contains("automatic switching deferred while displays sleep: lid:open") {
 		t.Fatal("the lid-open reconciliation was deferred as display sleep")
+	}
+}
+
+// An in-flight resume wake must not turn a successful IPC operation into an
+// error. The background path still needs its sentinel to schedule wake retries.
+func TestProfileAutoDuringPartialWakeDoesNotExposeRetryState(t *testing.T) {
+	monitors := []hypr.Monitor{
+		{Name: "eDP-1", Make: "Example", Model: "Panel", Width: 1920, Height: 1080, RefreshRate: 60, Scale: 1, DPMSStatus: true},
+		{Name: "DP-1", Make: "Example", Model: "External", Width: 1920, Height: 1080, RefreshRate: 60, Scale: 1, X: 1920, DPMSStatus: false},
+	}
+	data, err := json.Marshal(monitors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := newApplyBestTestEnvWithMonitors(t, string(data), string(data))
+	if err := env.store.Save(profile.FromMonitors("Desk", monitors)); err != nil {
+		t.Fatal(err)
+	}
+	svc := New(env.client, env.store, Config{MonitorsConf: env.monitorsConfPath, HyprConfig: env.hyprlandConfigPath, ConfigDir: filepath.Dir(env.monitorsConfPath)})
+	svc.wakeRequested.Store(true)
+	svc.setManualOverride(profile.MonitorSetHash(monitors), profile.FromMonitors("Manual", monitors))
+	if err := svc.SetProfileAuto(ipc.ProfileAutoParams{Enabled: true}); err != nil {
+		t.Fatalf("successful profile selection returned an error to IPC: %v", err)
+	}
+	if _, pinned := svc.manualOverride(profile.MonitorSetHash(monitors)); pinned {
+		t.Fatal("automatic selection did not clear manual override")
+	}
+	if !svc.wakeRequested.Load() {
+		t.Fatal("IPC operation cleared the pending wake request")
+	}
+	if err := svc.tryApplyBest(context.Background()); !errors.Is(err, errIncompleteWake) {
+		t.Fatalf("background retry state = %v, want incomplete wake", err)
 	}
 }
